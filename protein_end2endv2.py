@@ -53,6 +53,7 @@ except ImportError:
 AMINO = "ACDEFGHIKLMNPQRSTVWY"
 AA2IDX = {a: i for i, a in enumerate(AMINO)}
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+PAD_IGNORE = -100  # tell cross_entropy to ignore these targets
 
 # These are folders you probably already have from your setup
 D_PROTEINNET = Path("data/casp7_assets")
@@ -246,7 +247,7 @@ def infer_feat_dim_quick(max_len: int) -> int:
 class SequenceDataset(Dataset):
     """
     Very small dataset wrapper for (FASTA path, optional PDB path).
-    Only used when training the GRU.
+    Builds next-token labels and marks PAD as PAD_IGNORE so the loss ignores it.
     """
     def __init__(self, manifest, max_len: int, training: bool = True):
         self.manifest = manifest
@@ -260,15 +261,18 @@ class SequenceDataset(Dataset):
         fasta, pdb = self.manifest[i]
         seq = str(next(SeqIO.parse(fasta, "fasta")).seq)[:self.max_len]
 
-        # inputs = embedded sequence
+        # Inputs: per-residue embeddings to fixed length
         X = embed_sequence(seq, self.max_len)   # [max_len, F]
 
-        # targets = next-token (teacher forcing)
-        idxs = [AA2IDX.get(a, 0) for a in seq]
-        y = torch.zeros(self.max_len, dtype=torch.long)
-        if len(idxs) > 0:
-            roll = idxs[1:] + [idxs[-1]]
-            y[:len(roll)] = torch.tensor(roll, dtype=torch.long)
+        # Targets: next-token indices with PAD ignored
+        idxs = [AA2IDX.get(a, 0) for a in seq]  # [L]
+        y = torch.full((self.max_len,), PAD_IGNORE, dtype=torch.long)  # all PAD by default
+
+        # Fill only valid next-token positions: 0..L-2 get labels from 1..L-1
+        if len(idxs) > 1:
+            y[:len(idxs)-1] = torch.tensor(idxs[1:], dtype=torch.long)
+        # if len(idxs) <= 1, y stays all PAD_IGNORE
+
         return X, y
 
 # ==============================
@@ -294,48 +298,83 @@ class TimeNetLike_GRU(nn.Module):
         return self.head(y)          # [B, L, 20]
 
 def train_seq_model(model, loader, val_loader=None, epochs=3, lr=1e-3, name="timenet_gru"):
-    """Simplified training loop for the GRU model."""
+    """Simplified training loop for the GRU model (ignores PAD labels)."""
     model.to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    best = 1e9
+    best = float("inf")
     path = CHECKPOINT_DIR / f"{name}.pt"
+
     for ep in range(1, epochs + 1):
         model.train()
         losses, accs = [], []
         pbar = tqdm(loader, desc=f"[{name}] ep{ep}")
+
         for X, y in pbar:
-            X = X.to(DEVICE).float().unsqueeze(0) if X.dim() == 2 else X.to(DEVICE).float()
-            y = y.to(DEVICE)
+            # Ensure batch dimension and types
+            X = X.to(DEVICE).float()
+            if X.dim() == 2:  # [L,F] -> [1,L,F]
+                X = X.unsqueeze(0)
+            y = y.to(DEVICE)  # [B,L]
+
             logits = model(X)                 # [B, L, 20]
             B, L, C = logits.shape
-            loss = F.cross_entropy(logits.reshape(-1, C), y.reshape(-1))
+
+            # Cross-entropy that IGNORES PAD tokens
+            loss = F.cross_entropy(
+                logits.reshape(-1, C),
+                y.reshape(-1),
+                ignore_index=PAD_IGNORE
+            )
+
+            # Masked accuracy (only where y != PAD_IGNORE)
             with torch.no_grad():
-                acc = (logits.argmax(-1) == y).float().mean().item()
-            opt.zero_grad(); loss.backward(); opt.step()
-            losses.append(loss.item()); accs.append(acc)
+                pred = logits.argmax(-1)                  # [B,L]
+                mask = (y != PAD_IGNORE)                  # [B,L]
+                if mask.any():
+                    acc = (pred[mask] == y[mask]).float().mean().item()
+                else:
+                    acc = 0.0
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            losses.append(loss.item())
+            accs.append(acc)
             pbar.set_postfix(loss=np.mean(losses), acc=np.mean(accs))
-        # save last (or best if val given)
+
+        # Save best-by-validation loss if val provided, else save last
         if val_loader:
             v = eval_seq_loss(model, val_loader)
-            if v < best: best = v; torch.save(model.state_dict(), path)
+            if v < best:
+                best = v
+                torch.save(model.state_dict(), path)
         else:
             torch.save(model.state_dict(), path)
+
     print(f"Saved GRU -> {path}")
     return path
 
 @torch.no_grad()
 def eval_seq_loss(model, loader):
-    """Validation loss helper."""
+    """Validation loss (ignores PAD labels)."""
     model.eval().to(DEVICE)
     losses = []
     for X, y in loader:
-        X = X.to(DEVICE).float().unsqueeze(0) if X.dim() == 2 else X.to(DEVICE).float()
+        X = X.to(DEVICE).float()
+        if X.dim() == 2:
+            X = X.unsqueeze(0)
         y = y.to(DEVICE)
-        logits = model(X)
+
+        logits = model(X)                 # [B,L,20]
         B, L, C = logits.shape
-        loss = F.cross_entropy(logits.reshape(-1, C), y.reshape(-1))
+        loss = F.cross_entropy(
+            logits.reshape(-1, C),
+            y.reshape(-1),
+            ignore_index=PAD_IGNORE
+        )
         losses.append(loss.item())
-    return float(np.mean(losses))
+    return float(np.mean(losses)) if losses else float("nan")
 
 # ==============================
 # Distogram (U-Net-like) — same idea, beginner-wrapped
@@ -686,19 +725,88 @@ def softmax_T(logits: torch.Tensor, T: float = 1.0) -> torch.Tensor:
     z = z - z.max()
     return torch.softmax(z, dim=-1)
 
-def generate_sequence(models: List[nn.Module], weights: List[float],
-                      seed: str, total_len: int, max_len: int,
-                      T: float = 0.9) -> str:
-    """
-    Auto-regressive generation with a tiny ensemble (works fine with a single GRU).
-    """
+def _top_k_top_p_filter(probs, top_k=0, top_p=0.0):
+    # probs: torch.Tensor [V] (already softmaxed)
+    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+    keep = torch.ones_like(sorted_probs, dtype=torch.bool)
+
+    if top_k and top_k > 0:
+        keep[top_k:] = False
+
+    if top_p and top_p > 0.0:
+        cumsum = torch.cumsum(sorted_probs, dim=0)
+        keep = keep & (cumsum <= top_p)
+        # always keep at least the first token
+        keep[0] = True
+
+    mask = torch.zeros_like(probs, dtype=torch.bool)
+    mask[sorted_idx[keep]] = True
+    # renormalize kept probs
+    filtered = torch.where(mask, probs, torch.zeros_like(probs))
+    s = filtered.sum()
+    return filtered / s if s > 0 else probs
+
+def _apply_repetition_penalty(logits, seq_tokens, penalty=1.1):
+    # seq_tokens: list of int indices already generated
+    # reduce logits for tokens seen a lot
+    if not seq_tokens: return logits
+    from collections import Counter
+    c = Counter(seq_tokens)
+    for idx, cnt in c.items():
+        if cnt > 0:
+            logits[idx] /= (penalty ** cnt)
+    return logits
+
+def _violates_no_repeat_ngram(seq_tokens, cand_idx, n=3):
+    # prevent exact n-gram repetition
+    if n <= 0 or len(seq_tokens) < n-1: 
+        return False
+    # proposed n-gram is (last n-1) + cand
+    gram = tuple(seq_tokens[-(n-1):] + [cand_idx])
+    # search earlier for same gram
+    text = seq_tokens + [cand_idx]
+    for i in range(0, len(text) - n):
+        if tuple(text[i:i+n]) == gram:
+            return True
+    return False
+
+@torch.no_grad()
+def generate_sequence(models, weights, seed, total_len, max_len, 
+                      T=1.05, top_k=8, top_p=0.9, rep_penalty=1.1, no_repeat_ngram=3):
     seq = list(seed)
     steps = max(0, total_len - len(seq))
     for _ in range(steps):
+        # logits from ensemble
         logits = ensemble_next_logits_weighted(models, weights, "".join(seq), max_len)
-        probs = softmax_T(logits, T=T).cpu().numpy()
-        idx = np.random.choice(len(AMINO), p=probs)
-        seq.append(AMINO[idx])
+        # repetition penalty
+        token_hist = [AA2IDX[a] for a in seq if a in AA2IDX]
+        logits = _apply_repetition_penalty(logits.clone(), token_hist, penalty=rep_penalty)
+        # temperature + softmax
+        probs = softmax_T(logits, T=T)
+        # top-k / top-p filter
+        probs = _top_k_top_p_filter(probs, top_k=top_k, top_p=top_p)
+
+        # sample with n-gram block
+        cand_idx = None
+        tries = 0
+        while tries < 20:
+            idx = int(torch.multinomial(probs, num_samples=1))
+            if not _violates_no_repeat_ngram(token_hist, idx, n=no_repeat_ngram):
+                cand_idx = idx
+                break
+            # temporarily suppress this idx and renormalize
+            probs[idx] = 0.0
+            s = probs.sum()
+            if s <= 0:
+                # fallback: take argmax
+                cand_idx = int(torch.argmax(logits))
+                break
+            probs = probs / s
+            tries += 1
+
+        seq.append(AMINO[cand_idx if cand_idx is not None else int(torch.argmax(logits))])
+        if len(seq) >= total_len:
+            break
     return "".join(seq[:total_len])
 
 # ==============================
@@ -829,6 +937,12 @@ def main():
     parser.add_argument("--full-backbone", action="store_true", help="Write N, CA, C, O instead of CA-only")
     parser.add_argument("--occ", type=float, default=1.00, help="PDB occupancy for all atoms")
     parser.add_argument("--bfactor", type=float, default=None, help="Fixed B-factor (if omitted, we use a proxy)")
+
+    parser.add_argument("--temp", type=float, default=1.05)
+    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--rep-penalty", type=float, default=1.1)
+    parser.add_argument("--no-repeat-ngram", type=int, default=3)
 
     # AFDB scan cap (to avoid huge scans)
     parser.add_argument("--afdb-limit", type=int, default=1000)
