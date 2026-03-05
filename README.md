@@ -8,11 +8,20 @@ Generates a novel protein sequence and predicts its 3D structure, saved as a PDB
 2. **Structure prediction** — The sequence is fed into a distogram model that predicts pairwise distances between residues. These distances are converted to 3D coordinates using MDS, then smoothed to enforce realistic bond lengths.
 3. **Scoring** — A 2D contact map scorer and a 3D voxel scorer give a proxy confidence score (0–100), written into the PDB as the B-factor column.
 
-## Requirements
+## Setup
+
+This repo uses Git LFS for checkpoints and large files. Install it before cloning:
+
+```
+git lfs install
+git clone https://github.com/lavirox1/protein-project
+```
+
+Then install dependencies. PyTorch needs to be installed first with the correct CUDA version:
 
 ```
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-pip install transformers timm biopython tqdm numpy
+pip install -r requirements.txt
 ```
 
 > First run will download ProtBERT (~420MB), cached automatically after that.
@@ -72,4 +81,4 @@ The PDB file can be opened in [PyMOL](https://pymol.org) or [ChimeraX](https://w
 
 - Runs on CPU but is significantly faster with an NVIDIA GPU.
 - The proxy pLDDT score is not the same as AlphaFold's pLDDT — it's an approximation from models trained on limited data.
-- All models were trained with ProtBERT embeddings (dim=1024). Do not use `--no-plm` flags from older versions.
+- All models were trained with ProtBERT embeddings (dim=1024).
