@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Convert TFDS ProteinNet CASP7 into:
-- FASTA files:  <out_dir>/fasta/<id>.fasta
-- Cα-only PDBs: <out_dir>/pdb_ca/<id>.pdb
-- manifest.csv with: id,split,fasta_path,pdb_path,length
+Downloads and converts the ProteinNet CASP7 dataset (via TensorFlow Datasets)
+into FASTA files, CA-only PDBs, and a manifest CSV for training.
 
-Requires:
-  pip install tensorflow tensorflow-datasets numpy pandas tqdm
+Output:
+  <out_dir>/fasta/<id>.fasta
+  <out_dir>/pdb_ca/<id>.pdb
+  <out_dir>/manifest.csv
+
+Usage: python tfds_to_fasta_pdb.py --out_dir data/casp7_assets
+Requires: pip install tensorflow tensorflow-datasets numpy pandas tqdm
 """
-
-import os, csv, argparse
+import csv, argparse
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm

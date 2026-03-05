@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-import argparse, os, sys, shutil, gzip, zipfile, tarfile
+
+
+# Extracts AlphaFold Database (AFDB) archive files (.tar.gz, .zip, .pdb.gz)
+# into a flat folder of PDB/CIF files for use in training.
+# Usage: python extract_afdb_archives.py --src data/afdb_raw --dst data/afdb_extracted
+
+
+import argparse, os, shutil, gzip, zipfile, tarfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
