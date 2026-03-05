@@ -20,8 +20,7 @@ git clone https://github.com/lavirox1/protein-project
 Then install dependencies. PyTorch needs to be installed first with the correct CUDA version:
 
 ```
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements.txt
+pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
 > First run will download ProtBERT (~420MB), cached automatically after that.

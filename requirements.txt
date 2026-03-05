@@ -1,6 +1,4 @@
 torch
-torchvision
-torchaudio
 transformers
 timm
 numpy
